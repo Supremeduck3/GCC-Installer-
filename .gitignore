@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# PyInstaller
+/build/
+/dist/
+*.spec
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Configurações locais
+.vscode/
+*.log
+
+# Sistemas operacionais
+.DS_Store
+Thumbs.db
+
+# Arquivos gerados localmente
+*.zip
