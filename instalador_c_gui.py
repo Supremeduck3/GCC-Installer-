@@ -14,15 +14,39 @@ import queue
 import shlex
 import shutil
 import subprocess
-import sys
 import threading
-from pathlib import Path
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from tkinter.scrolledtext import ScrolledText
+from dataclasses import dataclass, field
+from pathlib import Path, PureWindowsPath
+from typing import Callable
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+    from tkinter.scrolledtext import ScrolledText
+except ModuleNotFoundError as _tk_error:  # pragma: no cover - depende do sistema
+    raise SystemExit(
+        "O Tkinter não está instalado.\n"
+        "Ubuntu/Debian: sudo apt-get install -y python3-tk\n"
+        "Fedora: sudo dnf install -y python3-tkinter\n"
+        "Windows: reinstale o Python marcando a opção 'tcl/tk and IDLE'."
+    ) from _tk_error
 
 
 APP_TITLE = "C Setup Assistant"
+
+MSYS_ROOT = PureWindowsPath(r"C:\msys64")
+MSYS_BASH = Path(MSYS_ROOT / "usr" / "bin" / "bash.exe")
+MSYS_GCC_BIN = PureWindowsPath(MSYS_ROOT / "ucrt64" / "bin")
+MSYS_GCC = PureWindowsPath(MSYS_GCC_BIN / "gcc.exe")
+
+# Códigos que o winget devolve quando o pacote já está instalado/atualizado.
+# No Windows o Python pode receber o valor com ou sem sinal.
+WINGET_ALREADY_OK = {
+    0,
+    0x8A15002B, 0x8A15002B - 2**32,  # UPDATE_NOT_APPLICABLE
+    0x8A150061, 0x8A150061 - 2**32,  # PACKAGE_ALREADY_INSTALLED
+}
+
 EXTENSIONS = {
     "cpp": "ms-vscode.cpptools",
     "cpp_pack": "ms-vscode.cpptools-extension-pack",
@@ -36,9 +60,325 @@ COMPONENTS = [
     ("debugger", "Depurador GDB", "Instala o GDB para depurar programas C."),
     ("vscode", "Visual Studio Code", "Instala o VS Code quando ele ainda não estiver disponível."),
     ("extensions", "Extensões principais", "Instala C/C++, o pacote C/C++, CMake Tools e Error Lens."),
-    ("code_runner", "Code Runner", "Instala o Code Runner e cria a configuração para executar arquivos .c."),
+    ("code_runner", "Code Runner", "Instala o Code Runner e configura a execução de arquivos .c."),
     ("cmake", "CMake", "Instala o CMake para projetos que usam configuração de build."),
 ]
+
+# Comandos do Code Runner. O $dir já vem entre aspas pelo próprio Code Runner.
+# Linux: bash/zsh. Windows: PowerShell (terminal padrão do VS Code), que não
+# aceita "&&" na versão 5.1 e precisa de "&" para executar um caminho entre aspas.
+RUNNER_LINUX = 'cd $dir && gcc "$fileName" -Wall -Wextra -std=c17 -o "$fileNameWithoutExt" && ./"$fileNameWithoutExt"'
+RUNNER_WINDOWS = (
+    "cd $dir; & '" + str(MSYS_GCC) + "' \"$fileName\" -Wall -Wextra -std=c17 "
+    "-o \"$fileNameWithoutExt.exe\"; if ($?) { & \".\\$fileNameWithoutExt.exe\" }"
+)
+
+
+@dataclass
+class Step:
+    """Uma etapa da instalação."""
+
+    description: str
+    args: list[str] | None = None
+    action: Callable[[], None] | None = None
+    ok_codes: set[int] = field(default_factory=lambda: {0})
+    skip_if: Callable[[], str | None] | None = None
+    needs_code: bool = False
+    optional: bool = False
+
+
+def detect_os() -> str:
+    current = platform.system().lower()
+    if current == "windows":
+        return "Windows"
+    if current == "linux":
+        info = ""
+        try:
+            info = Path("/etc/os-release").read_text(encoding="utf-8").lower()
+        except OSError:
+            pass
+        if any(name in info for name in ("fedora", "rhel", "centos")) or shutil.which("dnf"):
+            if not shutil.which("apt-get"):
+                return "Fedora"
+        return "Ubuntu/Debian"
+    return "Windows"
+
+
+def find_code() -> str | None:
+    """Procura o comando do VS Code no momento da execução (pode ter acabado de ser instalado)."""
+    candidates: list[str | None] = [shutil.which("code")]
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA", "")
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        candidates += [
+            os.path.join(local, "Programs", "Microsoft VS Code", "bin", "code.cmd"),
+            os.path.join(program_files, "Microsoft VS Code", "bin", "code.cmd"),
+        ]
+    else:
+        candidates += ["/snap/bin/code", "/usr/bin/code", "/usr/share/code/bin/code"]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
+
+
+def elevated_linux(script: str) -> list[str]:
+    """Executa um script shell como administrador sem depender de terminal."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return ["sh", "-c", script]
+    if shutil.which("pkexec") and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return ["pkexec", "sh", "-c", script]
+    # -n: não pergunta senha (não há terminal); falha com mensagem clara.
+    return ["sudo", "-n", "sh", "-c", script]
+
+
+def build_steps(target_os: str, selected: list[str], project_path: Path) -> list[Step]:
+    steps: list[Step] = []
+    extensions: list[str] = []
+
+    if "extensions" in selected:
+        extensions += [EXTENSIONS["cpp"], EXTENSIONS["cpp_pack"], EXTENSIONS["cmake_tools"], EXTENSIONS["error_lens"]]
+    if "code_runner" in selected:
+        extensions.append(EXTENSIONS["code_runner"])
+
+    if target_os == "Windows":
+        winget = ["winget", "install", "--exact", "--source", "winget",
+                  "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity", "--id"]
+        if "vscode" in selected:
+            steps.append(Step(
+                "Instalando o Visual Studio Code",
+                winget + ["Microsoft.VisualStudioCode"],
+                ok_codes=WINGET_ALREADY_OK,
+                skip_if=lambda: "o VS Code já está instalado" if find_code() else None,
+            ))
+        if "compiler" in selected or "debugger" in selected:
+            packages: list[str] = []
+            if "compiler" in selected:
+                packages += ["mingw-w64-ucrt-x86_64-gcc", "mingw-w64-ucrt-x86_64-make"]
+            if "debugger" in selected:
+                packages.append("mingw-w64-ucrt-x86_64-gdb")
+            steps.append(Step(
+                "Instalando o MSYS2",
+                winget + ["MSYS2.MSYS2"],
+                ok_codes=WINGET_ALREADY_OK,
+                skip_if=lambda: "o MSYS2 já está instalado" if MSYS_BASH.exists() else None,
+            ))
+            # Numa instalação nova, a 1ª atualização troca o núcleo e encerra com erro;
+            # a 2ª conclui a atualização.
+            steps.append(Step("Atualizando o núcleo do MSYS2", [str(MSYS_BASH), "-lc", "pacman -Syu --noconfirm"], optional=True))
+            steps.append(Step("Atualizando os pacotes do MSYS2", [str(MSYS_BASH), "-lc", "pacman -Syu --noconfirm"]))
+            steps.append(Step(
+                "Instalando GCC/GDB/Make",
+                [str(MSYS_BASH), "-lc", "pacman -S --needed --noconfirm " + " ".join(packages)],
+            ))
+            steps.append(Step("Adicionando o GCC ao PATH do usuário", action=add_gcc_to_windows_path))
+        if "cmake" in selected:
+            steps.append(Step(
+                "Instalando CMake",
+                winget + ["Kitware.CMake"],
+                ok_codes=WINGET_ALREADY_OK,
+                skip_if=lambda: "o CMake já está instalado" if shutil.which("cmake") else None,
+            ))
+
+    elif target_os == "Ubuntu/Debian":
+        packages = []
+        if "compiler" in selected:
+            packages += ["build-essential", "gcc", "make"]
+        if "debugger" in selected:
+            packages.append("gdb")
+        if "cmake" in selected:
+            packages.append("cmake")
+        if packages:
+            script = ("apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "
+                      + " ".join(packages))
+            steps.append(Step("Instalando " + ", ".join(packages) + " (apt)", elevated_linux(script)))
+        if "vscode" in selected:
+            if shutil.which("snap"):
+                steps.append(Step(
+                    "Instalando o Visual Studio Code (snap)",
+                    elevated_linux("snap install code --classic"),
+                    skip_if=lambda: "o VS Code já está instalado" if find_code() else None,
+                ))
+            else:
+                steps.append(Step("VS Code", action=lambda: _raise_warning(
+                    "snap não encontrado. Instale o VS Code pelo .deb em https://code.visualstudio.com/")))
+
+    elif target_os == "Fedora":
+        packages = []
+        if "compiler" in selected:
+            packages += ["gcc", "gcc-c++", "make"]
+        if "debugger" in selected:
+            packages.append("gdb")
+        if "cmake" in selected:
+            packages.append("cmake")
+        if packages:
+            steps.append(Step("Instalando " + ", ".join(packages) + " (dnf)",
+                              elevated_linux("dnf install -y " + " ".join(packages))))
+        if "vscode" in selected:
+            steps.append(Step("VS Code", action=lambda: _raise_warning(
+                "instale o VS Code pelo repositório oficial: https://code.visualstudio.com/docs/setup/linux")))
+
+    for extension in dict.fromkeys(extensions):
+        steps.append(Step(f"Instalando extensão {extension}", ["{code}", "--install-extension", extension, "--force"],
+                          needs_code=True))
+
+    if "code_runner" in selected:
+        steps.append(Step("Criando a configuração do Code Runner",
+                          action=lambda: write_code_runner_settings(project_path, target_os)))
+
+    return steps
+
+
+class StepWarning(Exception):
+    """Problema que não impede as demais etapas."""
+
+
+def _raise_warning(message: str) -> None:
+    raise StepWarning(message)
+
+
+def add_gcc_to_windows_path() -> None:
+    if not Path(MSYS_GCC).exists():
+        raise RuntimeError(f"O GCC não foi encontrado em {MSYS_GCC}.")
+    import winreg  # type: ignore[import-not-found]
+
+    entry = str(MSYS_GCC_BIN)
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
+        try:
+            current, kind = winreg.QueryValueEx(key, "Path")
+        except FileNotFoundError:
+            current, kind = "", winreg.REG_EXPAND_SZ
+        parts = [p for p in current.split(";") if p.strip()]
+        if not any(p.rstrip("\\").lower() == entry.lower() for p in parts):
+            parts.append(entry)
+            winreg.SetValueEx(key, "Path", 0, kind, ";".join(parts))
+    # Avisa o Windows que o ambiente mudou (novos terminais já enxergam o PATH).
+    try:
+        import ctypes
+
+        ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, "Environment", 2, 5000, None)
+    except Exception:  # noqa: BLE001
+        pass
+    os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + entry
+
+
+def write_code_runner_settings(project_path: Path, target_os: str) -> Path:
+    vscode_dir = project_path / ".vscode"
+    vscode_dir.mkdir(parents=True, exist_ok=True)
+    settings_path = vscode_dir / "settings.json"
+    settings: dict = {}
+    if settings_path.exists():
+        try:
+            loaded = json.loads(settings_path.read_text(encoding="utf-8-sig"))
+            settings = loaded if isinstance(loaded, dict) else {}
+            if not isinstance(loaded, dict):
+                raise ValueError
+        except (ValueError, OSError):
+            # settings.json com comentários (JSONC) ou inválido: não sobrescreve.
+            settings_path = vscode_dir / "settings.c-setup.generated.json"
+            settings = {}
+
+    if target_os == "Windows":
+        compiler, mode, command = str(MSYS_GCC), "windows-gcc-x64", RUNNER_WINDOWS
+    else:
+        compiler, mode, command = shutil.which("gcc") or "/usr/bin/gcc", "linux-gcc-x64", RUNNER_LINUX
+
+    settings.update({
+        "C_Cpp.default.compilerPath": compiler,
+        "C_Cpp.default.cStandard": "c17",
+        "C_Cpp.default.intelliSenseMode": mode,
+        "code-runner.runInTerminal": True,
+        "code-runner.saveFileBeforeRun": True,
+        "code-runner.clearPreviousOutput": True,
+    })
+    executor_map = settings.get("code-runner.executorMap")
+    executor_map = executor_map if isinstance(executor_map, dict) else {}
+    executor_map["c"] = command
+    settings["code-runner.executorMap"] = executor_map
+    if target_os == "Windows":
+        # O comando acima é para PowerShell; garante que o terminal do projeto seja ele.
+        settings.setdefault("terminal.integrated.defaultProfile.windows", "PowerShell")
+    associations = settings.get("files.associations")
+    associations = associations if isinstance(associations, dict) else {}
+    associations.update({"*.c": "c", "*.h": "c"})
+    settings["files.associations"] = associations
+    settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return settings_path
+
+
+def format_command(args: list[str]) -> str:
+    return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
+
+
+def run_streaming(args: list[str], log: Callable[[str], None]) -> int:
+    """Executa um comando mostrando a saída linha a linha."""
+    if os.name == "nt" and args[0].lower().endswith((".cmd", ".bat")):
+        args = ["cmd", "/c", *args]
+    env = dict(os.environ)
+    if os.name == "nt":
+        env.setdefault("MSYSTEM", "UCRT64")
+        env["CHERE_INVOKING"] = "1"
+    process = subprocess.Popen(
+        args,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        line = line.rstrip()
+        # Ignora barras de progresso do winget/pacman que só poluem o registro.
+        if line and not set(line.strip()) <= set("-\\|/ █▒░"):
+            log(line)
+    return process.wait()
+
+
+def run_steps(steps: list[Step], log: Callable[[str], None], on_stage: Callable[[int, str, bool], None]) -> list[str]:
+    """Executa as etapas. Devolve a lista de avisos; lança RuntimeError em falha."""
+    warnings: list[str] = []
+    for index, step in enumerate(steps, start=1):
+        on_stage(index, step.description, False)
+        reason = step.skip_if() if step.skip_if else None
+        if reason:
+            log(f"Pulando: {step.description} ({reason}).")
+            on_stage(index, step.description, True)
+            continue
+        try:
+            if step.action:
+                step.action()
+            elif step.args:
+                args = list(step.args)
+                if step.needs_code:
+                    code = find_code()
+                    if not code:
+                        raise StepWarning("comando 'code' do VS Code não encontrado; instale o VS Code e rode de novo")
+                    args = [code if a == "{code}" else a for a in args]
+                log(f"$ {format_command(args)}")
+                try:
+                    returncode = run_streaming(args, log)
+                except FileNotFoundError as error:
+                    raise RuntimeError(f"Comando não encontrado: {args[0]}. Verifique se ele está instalado.") from error
+                if returncode not in step.ok_codes:
+                    if step.optional:
+                        log(f"(código {returncode} ignorado; a próxima etapa completa a operação)")
+                    elif args[0] == "sudo":
+                        raise RuntimeError(
+                            "O sudo precisa de senha e não há terminal. Rode 'sudo -v' num terminal e "
+                            "abra o assistente de novo, ou instale o pacote 'policykit-1'.")
+                    else:
+                        raise RuntimeError(f"A etapa '{step.description}' terminou com código {returncode}.")
+            log(f"Concluído: {step.description}")
+        except StepWarning as warning:
+            message = f"{step.description}: {warning}"
+            warnings.append(message)
+            log("AVISO: " + message)
+        on_stage(index, step.description, True)
+    return warnings
 
 
 class InstallerApp(tk.Tk):
@@ -47,19 +387,19 @@ class InstallerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("980x720")
-        self.minsize(820, 600)
+        self.geometry("1000x820")
+        self.minsize(860, 760)
         self.configure(bg="#f4f7fb")
 
         self.command_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.install_thread: threading.Thread | None = None
         self.is_running = False
-        self.current_page = "home"
+        self.run_button: ttk.Button | None = None
         self.progress_var = tk.DoubleVar(value=0)
         self.status_var = tk.StringVar(value="Pronto para iniciar")
         self.step_var = tk.StringVar(value="0 de 0 etapas")
         self.total_steps = 0
-        self.os_var = tk.StringVar(value=self.detect_os())
+        self.os_var = tk.StringVar(value=detect_os())
         self.project_var = tk.StringVar(value=str(Path.cwd()))
         self.all_var = tk.BooleanVar(value=True)
         self.component_vars = {key: tk.BooleanVar(value=True) for key, _, _ in COMPONENTS}
@@ -69,14 +409,14 @@ class InstallerApp(tk.Tk):
         self.show_home()
         self.after(100, self._process_queue)
 
-    @staticmethod
-    def detect_os() -> str:
-        current = platform.system().lower()
-        if current == "windows":
-            return "Windows"
-        if current == "linux":
-            return "Ubuntu/Debian"
-        return "Windows"
+    # Mantidos como métodos para compatibilidade com o smoke test.
+    detect_os = staticmethod(detect_os)
+
+    def build_commands(self, target_os: str, selected: list[str], project_path: Path) -> list[Step]:
+        return build_steps(target_os, selected, project_path)
+
+    def write_code_runner_settings(self, project_path: Path, target_os: str) -> Path:
+        return write_code_runner_settings(project_path, target_os)
 
     def _configure_style(self) -> None:
         style = ttk.Style(self)
@@ -91,10 +431,12 @@ class InstallerApp(tk.Tk):
         style.configure("Subtitle.TLabel", background="#f4f7fb", foreground="#526581", font=("Segoe UI", 10))
         style.configure("Section.TLabel", background="#f4f7fb", foreground="#172b4d", font=("Segoe UI", 12, "bold"))
         style.configure("Card.TFrame", background="white", relief="solid", borderwidth=1)
-        style.configure("Card.TLabel", background="white", foreground="#172b4d", font=("Segoe UI", 10))
+        style.configure("Card.TCheckbutton", background="white", foreground="#172b4d", font=("Segoe UI", 10))
         style.configure("CardDescription.TLabel", background="white", foreground="#60708a", font=("Segoe UI", 9))
+        style.configure("App.TCheckbutton", background="#f4f7fb")
         style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=(16, 9))
         style.configure("Nav.TButton", font=("Segoe UI", 10), padding=(12, 7))
+        style.configure("App.Horizontal.TProgressbar", troughcolor="#e3e9f2", background="#2f6fed", bordercolor="#e3e9f2", thickness=14)
 
     def _build_shell(self) -> None:
         header = ttk.Frame(self, style="Header.TFrame", padding=(24, 14))
@@ -104,78 +446,82 @@ class InstallerApp(tk.Tk):
 
         nav = ttk.Frame(header, style="Header.TFrame")
         nav.pack(side="right")
-        self.home_button = ttk.Button(nav, text="Home", style="Nav.TButton", command=self.show_home)
-        self.home_button.pack(side="left", padx=4)
-        self.help_button = ttk.Button(nav, text="Como usar", style="Nav.TButton", command=self.show_help)
-        self.help_button.pack(side="left", padx=4)
+        ttk.Button(nav, text="Home", style="Nav.TButton", command=self.show_home).pack(side="left", padx=4)
+        ttk.Button(nav, text="Como usar", style="Nav.TButton", command=self.show_help).pack(side="left", padx=4)
 
-        self.page_container = ttk.Frame(self, style="App.TFrame", padding=(30, 24, 30, 12))
-        self.page_container.pack(fill="both", expand=True)
+        # A barra de progresso e o registro ficam embaixo e são empacotados antes
+        # da página, para nunca serem empurrados para fora da janela.
+        log_frame = ttk.Frame(self, style="App.TFrame", padding=(30, 0, 30, 22))
+        log_frame.pack(side="bottom", fill="x")
+        ttk.Label(log_frame, text="Registro da operação", style="Section.TLabel").pack(anchor="w", pady=(0, 5))
+        self.log = ScrolledText(log_frame, height=6, wrap="word", state="disabled", font=("Consolas", 9),
+                                background="#101827", foreground="#d8e2f0", insertbackground="white")
+        self.log.pack(fill="x")
 
         progress_frame = ttk.Frame(self, style="App.TFrame", padding=(30, 0, 30, 10))
-        progress_frame.pack(fill="x")
+        progress_frame.pack(side="bottom", fill="x")
         progress_top = ttk.Frame(progress_frame, style="App.TFrame")
         progress_top.pack(fill="x", pady=(0, 5))
         ttk.Label(progress_top, textvariable=self.status_var, style="Section.TLabel").pack(side="left")
         ttk.Label(progress_top, textvariable=self.step_var, style="Subtitle.TLabel").pack(side="right")
-        self.progressbar = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate", maximum=100, variable=self.progress_var)
-        self.progressbar.pack(fill="x")
+        ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate", maximum=100,
+                        variable=self.progress_var, style="App.Horizontal.TProgressbar").pack(fill="x")
 
-        log_frame = ttk.Frame(self, style="App.TFrame", padding=(30, 0, 30, 22))
-        log_frame.pack(fill="x")
-        ttk.Label(log_frame, text="Registro da operação", style="Section.TLabel").pack(anchor="w", pady=(0, 5))
-        self.log = ScrolledText(log_frame, height=7, wrap="word", state="disabled", font=("Consolas", 9), background="#101827", foreground="#d8e2f0", insertbackground="white")
-        self.log.pack(fill="x")
+        self.page_container = ttk.Frame(self, style="App.TFrame", padding=(30, 18, 30, 12))
+        self.page_container.pack(fill="both", expand=True)
 
     def _clear_page(self) -> None:
+        self.run_button = None
         for child in self.page_container.winfo_children():
             child.destroy()
 
     def show_home(self) -> None:
-        self.current_page = "home"
         self._clear_page()
 
-        ttk.Label(self.page_container, text="Configure seu ambiente de C", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(self.page_container, text="Escolha o sistema-alvo, o diretório do projeto e os componentes que deseja instalar.", style="Subtitle.TLabel").pack(anchor="w", pady=(4, 20))
+        page_title = ttk.Label(self.page_container, text="Configure seu ambiente de C", style="Title.TLabel")
+        page_title.pack(anchor="w")
+        ttk.Label(self.page_container, text="Escolha o sistema-alvo, o diretório do projeto e os componentes que deseja instalar.",
+                  style="Subtitle.TLabel").pack(anchor="w", pady=(4, 14))
 
         top = ttk.Frame(self.page_container, style="App.TFrame")
         top.pack(fill="x")
-        self._make_labeled_entry(top, "Sistema operacional", self.os_var, readonly=True, values=["Windows", "Ubuntu/Debian", "Fedora"])
+        self._make_os_selector(top)
         self._make_project_selector(top)
 
-        ttk.Label(self.page_container, text="Componentes", style="Section.TLabel").pack(anchor="w", pady=(22, 8))
+        ttk.Label(self.page_container, text="Componentes", style="Section.TLabel").pack(anchor="w", pady=(16, 6))
         selection_bar = ttk.Frame(self.page_container, style="App.TFrame")
         selection_bar.pack(fill="x", pady=(0, 8))
-        ttk.Checkbutton(selection_bar, text="Selecionar tudo", variable=self.all_var, command=self._toggle_all).pack(side="left")
-        ttk.Label(selection_bar, text="Você poderá executar somente o Code Runner, somente o compilador ou qualquer combinação.", style="Subtitle.TLabel").pack(side="left", padx=20)
+        ttk.Checkbutton(selection_bar, text="Selecionar tudo", variable=self.all_var, style="App.TCheckbutton",
+                        command=self._toggle_all).pack(side="left")
+        ttk.Label(selection_bar, text="Você pode instalar só o Code Runner, só o compilador ou qualquer combinação.",
+                  style="Subtitle.TLabel").pack(side="left", padx=20)
 
         cards = ttk.Frame(self.page_container, style="App.TFrame")
-        cards.pack(fill="both", expand=True)
+        cards.pack(fill="x")
         for index, (key, title, description) in enumerate(COMPONENTS):
-            card = ttk.Frame(cards, style="Card.TFrame", padding=(14, 11))
-            card.grid(row=index // 2, column=index % 2, sticky="nsew", padx=(0 if index % 2 == 0 else 8, 8 if index % 2 == 0 else 0), pady=5)
+            card = ttk.Frame(cards, style="Card.TFrame", padding=(14, 8))
+            card.grid(row=index // 2, column=index % 2, sticky="nsew",
+                      padx=(0 if index % 2 == 0 else 8, 8 if index % 2 == 0 else 0), pady=4)
             cards.grid_columnconfigure(index % 2, weight=1)
-            cards.grid_rowconfigure(index // 2, weight=1)
-            ttk.Checkbutton(card, text=title, variable=self.component_vars[key], command=self._update_all_state).pack(anchor="w")
-            ttk.Label(card, text=description, style="CardDescription.TLabel", wraplength=360, justify="left").pack(anchor="w", pady=(6, 0))
+            ttk.Checkbutton(card, text=title, variable=self.component_vars[key], style="Card.TCheckbutton",
+                            command=self._update_all_state).pack(anchor="w")
+            ttk.Label(card, text=description, style="CardDescription.TLabel", wraplength=400,
+                      justify="left").pack(anchor="w", pady=(6, 0))
 
         bottom = ttk.Frame(self.page_container, style="App.TFrame")
-        bottom.pack(fill="x", pady=(18, 0))
-        self.run_button = ttk.Button(bottom, text="Instalar componentes selecionados", style="Primary.TButton", command=self.start_installation)
-        if self.is_running:
-            self.run_button.configure(state="disabled", text="Instalando...")
+        bottom.pack(side="bottom", fill="x", pady=(12, 0), before=page_title)
+        self.run_button = ttk.Button(bottom, text="Instalar componentes selecionados", style="Primary.TButton",
+                                     command=self.start_installation)
         self.run_button.pack(side="right")
+        self._refresh_run_button()
         ttk.Button(bottom, text="Abrir instruções", command=self.show_help).pack(side="right", padx=(0, 10))
 
-    def _make_labeled_entry(self, parent: ttk.Frame, label: str, variable: tk.StringVar, readonly: bool = False, values: list[str] | None = None) -> None:
+    def _make_os_selector(self, parent: ttk.Frame) -> None:
         box = ttk.Frame(parent, style="App.TFrame")
         box.pack(side="left", fill="x", expand=True, padx=(0, 12))
-        ttk.Label(box, text=label, style="Section.TLabel").pack(anchor="w", pady=(0, 6))
-        if values:
-            widget = ttk.Combobox(box, textvariable=variable, values=values, state="readonly" if readonly else "normal")
-        else:
-            widget = ttk.Entry(box, textvariable=variable)
-        widget.pack(fill="x")
+        ttk.Label(box, text="Sistema operacional", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
+        ttk.Combobox(box, textvariable=self.os_var, values=["Windows", "Ubuntu/Debian", "Fedora"],
+                     state="readonly").pack(fill="x")
 
     def _make_project_selector(self, parent: ttk.Frame) -> None:
         box = ttk.Frame(parent, style="App.TFrame")
@@ -187,27 +533,30 @@ class InstallerApp(tk.Tk):
         ttk.Button(row, text="Escolher...", command=self.choose_project).pack(side="left", padx=(8, 0))
 
     def show_help(self) -> None:
-        self.current_page = "help"
         self._clear_page()
         ttk.Label(self.page_container, text="Como usar", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(self.page_container, text="Siga estas etapas para configurar o ambiente com segurança.", style="Subtitle.TLabel").pack(anchor="w", pady=(4, 12))
+        ttk.Label(self.page_container, text="Siga estas etapas para configurar o ambiente com segurança.",
+                  style="Subtitle.TLabel").pack(anchor="w", pady=(4, 12))
 
         help_text = (
             "1. Na Home, selecione o sistema operacional que será configurado.\n\n"
-            "2. Escolha a pasta raiz do seu projeto. O arquivo .vscode/settings.json será criado nessa pasta quando a configuração do Code Runner for selecionada.\n\n"
-            "3. Marque apenas o que precisa. Para um ambiente completo, use Selecionar tudo. Para instalar somente o executor, deixe marcado apenas Code Runner.\n\n"
-            "4. Clique em Instalar componentes selecionados. Algumas etapas podem pedir autorização de administrador.\n\n"
-            "5. Depois da instalação, abra um arquivo .c no VS Code e pressione Ctrl+Alt+N para executar pelo Code Runner.\n\n"
-            "Atenção: o aplicativo executa comandos do sistema escolhido. Use Windows quando o aplicativo estiver rodando no Windows e Ubuntu/Debian ou Fedora quando estiver rodando na distribuição Linux correspondente.\n\n"
-            "Windows: o GCC é instalado pelo MSYS2 em C:\\msys64\\ucrt64\\bin. Ubuntu/Debian: o GCC é instalado pelo apt. Fedora: o GCC é instalado pelo dnf.\n\n"
-            "Se algo falhar, consulte o Registro da operação na parte inferior da janela. Corrija o requisito indicado e execute novamente."
+            "2. Escolha a pasta raiz do seu projeto. O arquivo .vscode/settings.json será criado nessa pasta quando o Code Runner for selecionado.\n\n"
+            "3. Marque apenas o que precisa. Para um ambiente completo, use Selecionar tudo.\n\n"
+            "4. Clique em Instalar componentes selecionados. Algumas etapas pedem autorização de administrador (UAC no Windows, senha no Linux).\n\n"
+            "5. Depois da instalação, FECHE E ABRA o VS Code, abra um arquivo .c e pressione Ctrl+Alt+N para executar.\n\n"
+            "Windows: o GCC é instalado pelo MSYS2 em C:\\msys64\\ucrt64\\bin. Ubuntu/Debian: pelo apt. Fedora: pelo dnf.\n\n"
+            "Linux: se aparecer erro de senha do sudo, rode 'sudo -v' num terminal e abra o assistente pelo mesmo terminal.\n\n"
+            "Se algo falhar, consulte o Registro da operação na parte inferior da janela, corrija o requisito indicado e execute novamente. "
+            "Rodar de novo é seguro: o que já está instalado é pulado."
         )
-        text = ScrolledText(self.page_container, wrap="word", font=("Segoe UI", 10), padx=16, pady=16, background="white", foreground="#26364d", relief="solid", borderwidth=1)
+        text = ScrolledText(self.page_container, wrap="word", font=("Segoe UI", 10), padx=16, pady=16,
+                            background="white", foreground="#26364d", relief="solid", borderwidth=1)
         text.pack(fill="both", expand=True)
         text.insert("1.0", help_text)
         text.configure(state="disabled")
 
-        ttk.Button(self.page_container, text="Voltar para Home", style="Primary.TButton", command=self.show_home).pack(anchor="e", pady=(14, 0))
+        ttk.Button(self.page_container, text="Voltar para Home", style="Primary.TButton",
+                   command=self.show_home).pack(anchor="e", pady=(14, 0))
 
     def choose_project(self) -> None:
         selected = filedialog.askdirectory(title="Escolha a pasta raiz do projeto")
@@ -222,6 +571,13 @@ class InstallerApp(tk.Tk):
     def _update_all_state(self) -> None:
         self.all_var.set(all(variable.get() for variable in self.component_vars.values()))
 
+    def _refresh_run_button(self) -> None:
+        if self.run_button is not None and self.run_button.winfo_exists():
+            if self.is_running:
+                self.run_button.configure(state="disabled", text="Instalando...")
+            else:
+                self.run_button.configure(state="normal", text="Instalar componentes selecionados")
+
     def selected_components(self) -> list[str]:
         return [key for key, _, _ in COMPONENTS if self.component_vars[key].get()]
 
@@ -230,142 +586,6 @@ class InstallerApp(tk.Tk):
         self.log.insert("end", text.rstrip() + "\n")
         self.log.see("end")
         self.log.configure(state="disabled")
-
-    def _queue_log(self, text: str) -> None:
-        self.command_queue.put(("log", text))
-
-    def _make_command(self, args: list[str]) -> str:
-        if os.name == "nt":
-            return subprocess.list2cmdline(args)
-        return shlex.join(args)
-
-    def _elevated_linux(self, args: list[str]) -> list[str]:
-        if shutil.which("pkexec"):
-            return ["pkexec", *args]
-        return ["sudo", *args]
-
-    def _code_command(self) -> str:
-        candidates = [shutil.which("code")]
-        if os.name == "nt":
-            local = os.environ.get("LOCALAPPDATA", "")
-            candidates.extend([
-                os.path.join(local, "Programs", "Microsoft VS Code", "bin", "code.cmd"),
-                r"C:\Program Files\Microsoft VS Code\bin\code.cmd",
-            ])
-        for candidate in candidates:
-            if candidate and Path(candidate).exists():
-                return candidate
-        return "code"
-
-    def build_commands(self, target_os: str, selected: list[str], project_path: Path) -> list[tuple[str, list[str] | None]]:
-        commands: list[tuple[str, list[str] | None]] = []
-        code = self._code_command()
-        extensions: list[str] = []
-
-        if target_os == "Windows":
-            bash = r"C:\msys64\usr\bin\bash.exe"
-            if "vscode" in selected:
-                commands.append(("Instalando o Visual Studio Code", ["winget", "install", "--id", "Microsoft.VisualStudioCode", "--exact", "--source", "winget", "--accept-package-agreements", "--accept-source-agreements"]))
-            if "compiler" in selected or "debugger" in selected:
-                commands.append(("Instalando ou atualizando o MSYS2", ["winget", "install", "--id", "MSYS2.MSYS2", "--exact", "--source", "winget", "--accept-package-agreements", "--accept-source-agreements"]))
-                commands.append(("Atualizando os pacotes do MSYS2", [bash, "-lc", "pacman -Syu --noconfirm"]),)
-                packages = []
-                if "compiler" in selected:
-                    packages.extend(["mingw-w64-ucrt-x86_64-gcc", "mingw-w64-ucrt-x86_64-make"])
-                if "debugger" in selected:
-                    packages.append("mingw-w64-ucrt-x86_64-gdb")
-                commands.append(("Instalando GCC/GDB/Make", [bash, "-lc", "pacman -S --needed --noconfirm " + " ".join(packages)]))
-                commands.append(("Adicionando o GCC ao PATH do usuário", None))
-            if "cmake" in selected:
-                commands.append(("Instalando CMake", ["winget", "install", "--id", "Kitware.CMake", "--exact", "--source", "winget", "--accept-package-agreements", "--accept-source-agreements"]))
-            if "extensions" in selected:
-                extensions.extend([EXTENSIONS["cpp"], EXTENSIONS["cpp_pack"], EXTENSIONS["cmake_tools"], EXTENSIONS["error_lens"]])
-            if "code_runner" in selected:
-                extensions.append(EXTENSIONS["code_runner"])
-
-        elif target_os == "Ubuntu/Debian":
-            if "compiler" in selected:
-                commands.append(("Instalando GCC e ferramentas de compilação", self._elevated_linux(["apt-get", "update"])))
-                commands.append(("Instalando GCC/Make", self._elevated_linux(["apt-get", "install", "-y", "build-essential", "gcc", "make"])))
-            if "debugger" in selected:
-                commands.append(("Instalando GDB", self._elevated_linux(["apt-get", "install", "-y", "gdb"])))
-            if "vscode" in selected:
-                if shutil.which("snap"):
-                    commands.append(("Instalando o Visual Studio Code", self._elevated_linux(["snap", "install", "code", "--classic"])))
-                else:
-                    commands.append(("VS Code: instalar manualmente", None))
-            if "cmake" in selected:
-                commands.append(("Instalando CMake", self._elevated_linux(["apt-get", "install", "-y", "cmake"])))
-            if "extensions" in selected:
-                extensions.extend([EXTENSIONS["cpp"], EXTENSIONS["cpp_pack"], EXTENSIONS["cmake_tools"], EXTENSIONS["error_lens"]])
-            if "code_runner" in selected:
-                extensions.append(EXTENSIONS["code_runner"])
-
-        elif target_os == "Fedora":
-            if "compiler" in selected:
-                commands.append(("Instalando GCC e ferramentas de desenvolvimento", self._elevated_linux(["dnf", "groupinstall", "-y", "Development Tools"])))
-                commands.append(("Instalando GCC/Make", self._elevated_linux(["dnf", "install", "-y", "gcc", "gcc-c++", "make"])))
-            if "debugger" in selected:
-                commands.append(("Instalando GDB", self._elevated_linux(["dnf", "install", "-y", "gdb"])))
-            if "vscode" in selected:
-                commands.append(("VS Code: instalar manualmente", None))
-            if "cmake" in selected:
-                commands.append(("Instalando CMake", self._elevated_linux(["dnf", "install", "-y", "cmake"])))
-            if "extensions" in selected:
-                extensions.extend([EXTENSIONS["cpp"], EXTENSIONS["cpp_pack"], EXTENSIONS["cmake_tools"], EXTENSIONS["error_lens"]])
-            if "code_runner" in selected:
-                extensions.append(EXTENSIONS["code_runner"])
-
-        for extension in dict.fromkeys(extensions):
-            commands.append((f"Instalando extensão {extension}", [code, "--install-extension", extension, "--force"]))
-
-        if "code_runner" in selected:
-            commands.append(("Criando a configuração do Code Runner", None))
-            commands.append(("Criando a pasta .vscode", None))
-
-        return commands
-
-    def write_code_runner_settings(self, project_path: Path, target_os: str) -> Path:
-        vscode_dir = project_path / ".vscode"
-        vscode_dir.mkdir(parents=True, exist_ok=True)
-        settings_path = vscode_dir / "settings.json"
-        if settings_path.exists():
-            try:
-                settings = json.loads(settings_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                settings_path = vscode_dir / "settings.c-setup.generated.json"
-                settings = {}
-        else:
-            settings = {}
-
-        if target_os == "Windows":
-            compiler = r"C:\msys64\ucrt64\bin\gcc.exe"
-            mode = "windows-gcc-x64"
-            command = 'cd $dir && gcc "$fileName" -Wall -Wextra -std=c17 -o "$fileNameWithoutExt.exe" && "$dir\\$fileNameWithoutExt.exe"'
-        else:
-            compiler = "/usr/bin/gcc"
-            mode = "linux-gcc-x64"
-            command = 'cd $dir && gcc "$fileName" -Wall -Wextra -std=c17 -o "$fileNameWithoutExt" && "$dir/$fileNameWithoutExt"'
-
-        settings.update({
-            "C_Cpp.default.compilerPath": compiler,
-            "C_Cpp.default.cStandard": "c17",
-            "C_Cpp.default.intelliSenseMode": mode,
-            "code-runner.runInTerminal": True,
-            "code-runner.saveFileBeforeRun": True,
-        })
-        executor_map = settings.get("code-runner.executorMap", {})
-        if not isinstance(executor_map, dict):
-            executor_map = {}
-        executor_map["c"] = command
-        settings["code-runner.executorMap"] = executor_map
-        associations = settings.get("files.associations", {})
-        if not isinstance(associations, dict):
-            associations = {}
-        associations.update({"*.c": "c", "*.h": "c"})
-        settings["files.associations"] = associations
-        settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        return settings_path
 
     def start_installation(self) -> None:
         if self.is_running:
@@ -376,90 +596,51 @@ class InstallerApp(tk.Tk):
             return
 
         target_os = self.os_var.get()
-        project_path = Path(self.project_var.get()).expanduser()
-        if not project_path.exists():
-            try:
-                project_path.mkdir(parents=True, exist_ok=True)
-            except OSError as error:
-                messagebox.showerror("Pasta inválida", f"Não foi possível criar a pasta escolhida:\n{error}")
-                return
-
-        current = self.detect_os()
+        current = detect_os()
+        if (target_os == "Windows") != (os.name == "nt"):
+            messagebox.showerror(
+                "Sistema diferente",
+                f"Este computador é {current}, mas você escolheu {target_os}.\n\n"
+                "Execute o assistente no próprio sistema que será configurado.")
+            return
         if current != target_os and not messagebox.askyesno(
-            "Sistema diferente",
-            f"O sistema detectado é {current}, mas você escolheu {target_os}.\n\nOs comandos só funcionarão se forem compatíveis com o sistema em execução. Deseja continuar?",
+            "Distribuição diferente",
+            f"A distribuição detectada é {current}, mas você escolheu {target_os}. Deseja continuar?",
         ):
             return
 
+        project_path = Path(self.project_var.get()).expanduser()
+        try:
+            project_path.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            messagebox.showerror("Pasta inválida", f"Não foi possível criar a pasta escolhida:\n{error}")
+            return
+
+        steps = build_steps(target_os, selected, project_path)
         self.is_running = True
-        self.run_button.configure(state="disabled", text="Instalando...")
-        self.total_steps = len(self.build_commands(target_os, selected, project_path))
+        self._refresh_run_button()
+        self.total_steps = len(steps)
         self.progress_var.set(0)
         self.status_var.set("Preparando instalação...")
         self.step_var.set(f"0 de {self.total_steps} etapas")
         self.append_log(f"Iniciando configuração para {target_os} em {project_path}")
         self.append_log("Componentes: " + ", ".join(title for key, title, _ in COMPONENTS if key in selected))
-        self.append_log(f"Total de etapas: {self.total_steps}")
-        self.install_thread = threading.Thread(target=self._installation_worker, args=(target_os, selected, project_path), daemon=True)
+        self.install_thread = threading.Thread(target=self._installation_worker, args=(steps,), daemon=True)
         self.install_thread.start()
 
-    def _installation_worker(self, target_os: str, selected: list[str], project_path: Path) -> None:
+    def _installation_worker(self, steps: list[Step]) -> None:
         try:
-            for step_index, (description, args) in enumerate(self.build_commands(target_os, selected, project_path), start=1):
-                self.command_queue.put(("stage", (step_index, description, False)))
-                if args is None:
-                    if description == "Adicionando o GCC ao PATH do usuário":
-                        if target_os == "Windows":
-                            self._run_path_update_windows()
-                        self.command_queue.put(("stage", (step_index, description, True)))
-                        continue
-                    if description == "Criando a configuração do Code Runner":
-                        settings_path = self.write_code_runner_settings(project_path, target_os)
-                        self._queue_log(f"Configuração criada em {settings_path}")
-                        self.command_queue.put(("stage", (step_index, description, True)))
-                        continue
-                    if description == "Criando a pasta .vscode":
-                        self.command_queue.put(("stage", (step_index, description, True)))
-                        continue
-                    self._queue_log(f"Aviso: {description}. Consulte a aba Como usar.")
-                    self.command_queue.put(("stage", (step_index, description, True)))
-                    continue
-                self._queue_log(f"$ {self._make_command(args)}")
-                result = subprocess.run(
-                    args,
-                    shell=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-                )
-                if result.stdout:
-                    self._queue_log(result.stdout.rstrip())
-                if result.returncode != 0:
-                    raise RuntimeError(f"A etapa '{description}' terminou com código {result.returncode}.")
-                self._queue_log(f"Concluído: {description}")
-                self.command_queue.put(("stage", (step_index, description, True)))
-            self.command_queue.put(("done", "Configuração concluída com sucesso."))
-        except FileNotFoundError as error:
-            self.command_queue.put(("error", f"Comando não encontrado: {error}. Verifique se o gerenciador necessário está instalado."))
-        except Exception as error:  # noqa: BLE001 - a mensagem será mostrada na interface
+            warnings = run_steps(
+                steps,
+                log=lambda text: self.command_queue.put(("log", text)),
+                on_stage=lambda i, d, done: self.command_queue.put(("stage", (i, d, done))),
+            )
+            message = "Configuração concluída com sucesso."
+            if warnings:
+                message = "Configuração concluída com avisos:\n\n" + "\n".join("• " + w for w in warnings)
+            self.command_queue.put(("done", message))
+        except Exception as error:  # noqa: BLE001 - a mensagem é mostrada na interface
             self.command_queue.put(("error", str(error)))
-
-    def _run_path_update_windows(self) -> None:
-        powershell = [
-            "powershell",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            "$entry='C:\\msys64\\ucrt64\\bin'; $p=[Environment]::GetEnvironmentVariable('Path','User'); if ($null -eq $p) {$p=''}; if ($p -notlike ('*' + $entry + '*')) {[Environment]::SetEnvironmentVariable('Path', ($p.TrimEnd(';') + ';' + $entry).Trim(';'), 'User')}",
-        ]
-        result = subprocess.run(powershell, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        if result.returncode != 0:
-            raise RuntimeError("Não foi possível atualizar o PATH do usuário no Windows.")
-        self._queue_log("GCC adicionado ao PATH do usuário. Reinicie o VS Code para reconhecê-lo.")
 
     def _process_queue(self) -> None:
         try:
@@ -468,35 +649,34 @@ class InstallerApp(tk.Tk):
                 if event == "log":
                     self.append_log(str(payload))
                 elif event == "stage":
-                    step_index, description, completed = payload
+                    step_index, description, completed = payload  # type: ignore[misc]
+                    done_steps = step_index if completed else step_index - 1
+                    self.progress_var.set(done_steps / self.total_steps * 100 if self.total_steps else 100)
                     if completed:
-                        percent = (step_index / self.total_steps * 100) if self.total_steps else 100
-                        self.progress_var.set(percent)
                         self.status_var.set(f"Concluído: {description}")
                         self.step_var.set(f"{step_index} de {self.total_steps} etapas")
                     else:
-                        percent = ((step_index - 1) / self.total_steps * 100) if self.total_steps else 0
-                        self.progress_var.set(percent)
                         self.status_var.set(f"Executando: {description}")
                         self.step_var.set(f"Etapa {step_index} de {self.total_steps}")
-                elif event == "done":
+                elif event in ("done", "error"):
                     self.is_running = False
-                    self.progress_var.set(100)
-                    self.status_var.set("Concluído")
-                    self.step_var.set(f"{self.total_steps} de {self.total_steps} etapas")
-                    self.run_button.configure(state="normal", text="Instalar componentes selecionados")
-                    self.append_log(str(payload))
-                    messagebox.showinfo("Concluído", str(payload))
-                elif event == "error":
-                    self.is_running = False
-                    self.status_var.set("Falha na instalação")
-                    self.step_var.set("Operação interrompida")
-                    self.run_button.configure(state="normal", text="Instalar componentes selecionados")
-                    self.append_log("ERRO: " + str(payload))
-                    messagebox.showerror("Falha na instalação", str(payload))
+                    self._refresh_run_button()
+                    if event == "done":
+                        self.progress_var.set(100)
+                        self.status_var.set("Concluído")
+                        self.step_var.set(f"{self.total_steps} de {self.total_steps} etapas")
+                        self.append_log(str(payload))
+                        messagebox.showinfo("Concluído", str(payload) + "\n\nReinicie o VS Code para aplicar tudo.")
+                    else:
+                        self.status_var.set("Falha na instalação")
+                        self.step_var.set("Operação interrompida")
+                        self.append_log("ERRO: " + str(payload))
+                        messagebox.showerror("Falha na instalação", str(payload))
         except queue.Empty:
             pass
-        self.after(100, self._process_queue)
+        finally:
+            # Sempre reagenda, mesmo se algo acima falhar, para a janela não "congelar".
+            self.after(100, self._process_queue)
 
 
 def main() -> None:

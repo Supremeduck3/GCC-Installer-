@@ -7,9 +7,12 @@ Este pacote configura um ambiente básico para programar em **C** no Visual Stud
 | Arquivo | Finalidade |
 |---|---|
 | `install-c-vscode.ps1` | Instalação no Windows usando MSYS2 e `winget`. |
-| `install-c-vscode.sh` | Instalação no Ubuntu/Debian usando `apt`. |
+| `install-c-vscode.sh` | Instalação no Ubuntu/Debian (`apt`) ou Fedora (`dnf`). |
+| `instalador_c_gui.py` | Assistente gráfico (Windows e Linux). Veja `README-GUI.md`. |
 
 > Os scripts devem ser executados a partir da pasta raiz do seu projeto. Assim, a configuração é criada em `.vscode/settings.json`.
+>
+> Pode rodar os scripts de novo sem medo: o que já está instalado é pulado.
 
 ## Windows
 
@@ -36,7 +39,7 @@ gdb --version
 
 Se o comando `code` não estiver disponível após a instalação do VS Code, reinicie o terminal e execute novamente o script para instalar as extensões.
 
-## Ubuntu ou Debian
+## Ubuntu, Debian ou Fedora
 
 Dê permissão de execução e execute o script:
 
@@ -77,7 +80,9 @@ int main(void) {
 }
 ```
 
-Abra o arquivo no VS Code e pressione **Ctrl + Alt + N**, ou clique no botão **Run Code**. O Code Runner salvará o arquivo, compilará usando `gcc` com `-Wall`, `-Wextra` e o padrão **C17**, e executará o programa no terminal integrado.
+Abra o arquivo no VS Code e pressione **Ctrl + Alt + N**, ou clique no botão **Run Code**. O Code Runner salvará o arquivo, compilará usando `gcc` com `-Wall`, `-Wextra` e o padrão **C17**, e executará o programa no terminal integrado (dá para usar `scanf` normalmente).
+
+No Windows, o comando gerado é próprio para o PowerShell, que é o terminal padrão do VS Code; por isso a configuração também fixa o PowerShell como terminal do projeto.
 
 A compilação manual equivalente no Linux é:
 
